@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+data/chroma/
+data/checkpoints.sqlite
+data/checkpoints.sqlite-*
+dist/
+build/
+*.egg-info/
+.env
+

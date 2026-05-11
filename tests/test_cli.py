@@ -10,11 +10,14 @@ class FakeService:
     def ingest_sources(self, sources, *, collection=None):
         return IngestResponse(collection=collection or "default", chunks_added=1, sources=sources, ids=["1"])
 
-    def ask(self, question, *, collection=None, max_attempts=None, thread_id=None):
+    def ask(self, question, *, collection=None, max_attempts=None, thread_id=None, focus_sources=None):
         return AskResponse(status="insufficient_info", answer=FALLBACK_ANSWER, citations=[], attempts=[], thread_id="t1")
 
     def reset_collection(self, collection=None):
         self.reset = collection
+
+    def delete_sources(self, sources, *, collection=None):
+        return len(sources)
 
 
 def test_doctor_success(monkeypatch):
@@ -33,7 +36,7 @@ def test_ingest_command(monkeypatch):
 
 def test_ask_command(monkeypatch):
     monkeypatch.setattr(cli, "build_service", lambda: FakeService())
-    result = CliRunner().invoke(cli.app, ["ask", "What?", "--collection", "docs"])
+    result = CliRunner().invoke(cli.app, ["ask", "What?", "--collection", "docs", "--source", "doc.md"])
     assert result.exit_code == 0
     assert FALLBACK_ANSWER in result.output
 
@@ -43,6 +46,13 @@ def test_reset_command(monkeypatch):
     result = CliRunner().invoke(cli.app, ["reset", "--collection", "docs"])
     assert result.exit_code == 0
     assert '{"reset": "docs"}' in result.output
+
+
+def test_delete_source_command(monkeypatch):
+    monkeypatch.setattr(cli, "build_service", lambda: FakeService())
+    result = CliRunner().invoke(cli.app, ["delete-source", "--collection", "docs", "--source", "doc.md"])
+    assert result.exit_code == 0
+    assert '"deleted_chunks": 1' in result.output
 
 
 def test_ui_command(monkeypatch):

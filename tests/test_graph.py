@@ -1,6 +1,6 @@
 from self_healing_rag.config import Settings
 from self_healing_rag.constants import FALLBACK_ANSWER
-from self_healing_rag.graph import SelfHealingRag
+from self_healing_rag.graph import SelfHealingRag, is_overview_question, sanitize_retrieval_query
 from self_healing_rag.schemas import CriticResult, RetrievedChunk
 
 
@@ -23,7 +23,7 @@ class FakeComponents:
         self.queries = []
         self.raises_critic = raises_critic
 
-    def retrieve(self, query, *, collection, top_k, fetch_k):
+    def retrieve(self, query, *, collection, top_k, fetch_k, focus_sources=None):
         self.queries.append(query)
         return self.chunks
 
@@ -46,7 +46,7 @@ class FailingRetrieveComponents(FakeComponents):
     def __init__(self):
         super().__init__([])
 
-    def retrieve(self, query, *, collection, top_k, fetch_k):
+    def retrieve(self, query, *, collection, top_k, fetch_k, focus_sources=None):
         raise ConnectionError("Failed to connect to Ollama")
 
 
@@ -62,6 +62,8 @@ def test_graph_accepts_first_answer(tmp_path):
     assert response.status == "answered"
     assert response.citations[0].id == "C1"
     assert len(response.attempts) == 1
+    assert response.attempts[0].retrieval_strategy == "hybrid"
+    assert response.attempts[0].retrieval_confidence == 1.0
 
 
 def test_graph_retries_then_accepts(tmp_path):
@@ -115,3 +117,18 @@ def test_graph_stops_on_retrieval_runtime_error(tmp_path):
     assert response.status == "insufficient_info"
     assert len(response.attempts) == 1
     assert "Retrieval failed" in response.attempts[0].critic_reason
+
+
+def test_overview_question_detection():
+    assert is_overview_question("What is this document about?")
+    assert is_overview_question("What's this PDF about?")
+    assert is_overview_question("Tell me about this file")
+    assert is_overview_question("summarize this document")
+    assert not is_overview_question("What does the critic do after a rejection?")
+
+
+def test_sanitize_retrieval_query_strips_prefix_and_truncates():
+    query = sanitize_retrieval_query("Rewritten query: " + ("hantavirus transmission " * 30), max_length=80)
+
+    assert not query.lower().startswith("rewritten query")
+    assert len(query) <= 80

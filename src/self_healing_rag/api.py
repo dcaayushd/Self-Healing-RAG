@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import Depends, FastAPI, File, Form, UploadFile
 
 from self_healing_rag.config import get_settings
-from self_healing_rag.schemas import AskRequest, AskResponse, HealthResponse, IngestRequest, IngestResponse
+from self_healing_rag.schemas import AskRequest, AskResponse, HealthResponse, IndexStats, IngestRequest, IngestResponse
 from self_healing_rag.service import RagService, build_service
 
 app = FastAPI(title="Self-Healing RAG", version="0.1.0")
@@ -41,4 +41,10 @@ def ask(request: AskRequest, service: RagService = Depends(get_rag_service)) -> 
         collection=request.collection,
         max_attempts=request.max_attempts,
         thread_id=request.thread_id,
+        focus_sources=request.focus_sources,
     )
+
+
+@app.get("/collections/{collection}/stats", response_model=IndexStats)
+def collection_stats(collection: str, service: RagService = Depends(get_rag_service)) -> IndexStats:
+    return service.collection_stats(collection)

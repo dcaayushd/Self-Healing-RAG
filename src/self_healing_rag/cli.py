@@ -105,6 +105,7 @@ def ask(
     question: str = typer.Argument(..., help="Question to answer from the indexed documents."),
     collection: str = typer.Option(None, "--collection", "-c", help="Chroma collection name."),
     max_attempts: int = typer.Option(None, "--max-attempts", "-m", help="Maximum retrieve/generate/critique attempts."),
+    source: list[str] = typer.Option(None, "--source", "-s", help="Limit retrieval to one or more exact source IDs."),
     json_output: bool = typer.Option(False, "--json", help="Emit the full JSON response."),
 ) -> None:
     """Ask a question through the self-healing LangGraph workflow."""
@@ -114,6 +115,7 @@ def ask(
             question,
             collection=collection or settings.default_collection,
             max_attempts=max_attempts or settings.max_attempts,
+            focus_sources=source or [],
         )
     except Exception as exc:
         _fail(str(exc))
@@ -140,6 +142,21 @@ def reset(collection: str = typer.Option(None, "--collection", "-c", help="Chrom
     except Exception as exc:
         _fail(str(exc))
     typer.echo(json.dumps({"reset": target}))
+
+
+@app.command()
+def delete_source(
+    source: list[str] = typer.Option(..., "--source", "-s", help="Exact source ID to delete from the collection."),
+    collection: str = typer.Option(None, "--collection", "-c", help="Chroma collection name."),
+) -> None:
+    """Delete one or more indexed sources from a collection."""
+    settings = get_settings()
+    target = collection or settings.default_collection
+    try:
+        deleted = build_service().delete_sources(source, collection=target)
+    except Exception as exc:
+        _fail(str(exc))
+    typer.echo(json.dumps({"collection": target, "deleted_chunks": deleted, "sources": source}))
 
 
 if __name__ == "__main__":

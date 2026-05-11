@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import re
 from typing import Literal, Protocol
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ from self_healing_rag.prompts import (
     answer_user_prompt,
     cited_ids,
     critic_user_prompt,
+    normalize_answer_citations,
     parse_critic_json,
     rewrite_user_prompt,
 )
@@ -32,7 +34,15 @@ from self_healing_rag.vector_store import VectorStoreManager
 
 
 class RagComponents(Protocol):
-    def retrieve(self, query: str, *, collection: str, top_k: int, fetch_k: int) -> list[RetrievedChunk]:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        collection: str,
+        top_k: int,
+        fetch_k: int,
+        focus_sources: list[str] | None = None,
+    ) -> list[RetrievedChunk]:
         ...
 
     def generate_answer(self, question: str, chunks: list[RetrievedChunk]) -> str:
@@ -58,6 +68,9 @@ class RagState(TypedDict, total=False):
     attempts: list[dict]
     error_notes: list[str]
     runtime_error: str
+    focus_sources: list[str]
+    retrieval_strategy: str
+    retrieval_confidence: float
 
 
 class OllamaRagComponents:
@@ -70,8 +83,26 @@ class OllamaRagComponents:
             temperature=0,
         )
 
-    def retrieve(self, query: str, *, collection: str, top_k: int, fetch_k: int) -> list[RetrievedChunk]:
-        return self.vector_store.search(query, collection=collection, top_k=top_k, fetch_k=fetch_k)
+    def retrieve(
+        self,
+        query: str,
+        *,
+        collection: str,
+        top_k: int,
+        fetch_k: int,
+        focus_sources: list[str] | None = None,
+    ) -> list[RetrievedChunk]:
+        if is_overview_question(query):
+            chunks = self.vector_store.overview(collection=collection, limit=top_k, focus_sources=focus_sources)
+            if chunks:
+                return chunks
+        return self.vector_store.search(
+            query,
+            collection=collection,
+            top_k=top_k,
+            fetch_k=fetch_k,
+            focus_sources=focus_sources,
+        )
 
     def generate_answer(self, question: str, chunks: list[RetrievedChunk]) -> str:
         if not chunks:
@@ -79,7 +110,7 @@ class OllamaRagComponents:
         response = self.llm.invoke(
             [
                 SystemMessage(content=ANSWER_SYSTEM),
-                HumanMessage(content=answer_user_prompt(question, chunks)),
+                HumanMessage(content=answer_user_prompt(question, chunks, overview=is_overview_question(question))),
             ]
         )
         return _message_content(response.content)
@@ -126,6 +157,7 @@ class SelfHealingRag:
         collection: str | None = None,
         max_attempts: int | None = None,
         thread_id: str | None = None,
+        focus_sources: list[str] | None = None,
     ) -> AskResponse:
         thread_id = thread_id or str(uuid4())
         attempts = max(1, max_attempts or self.settings.max_attempts)
@@ -137,6 +169,7 @@ class SelfHealingRag:
             "max_attempts": attempts,
             "attempts": [],
             "error_notes": [],
+            "focus_sources": focus_sources or [],
         }
         result = self.graph.invoke(initial, config={"configurable": {"thread_id": thread_id}})
         return _response_from_state(result, thread_id)
@@ -175,6 +208,7 @@ class SelfHealingRag:
                 collection=state.get("collection", self.settings.default_collection),
                 top_k=self.settings.top_k,
                 fetch_k=self.settings.fetch_k,
+                focus_sources=state.get("focus_sources", []),
             )
         except Exception as exc:
             message = f"Retrieval failed: {exc}"
@@ -186,11 +220,16 @@ class SelfHealingRag:
                 "answer": FALLBACK_ANSWER,
                 "error_notes": notes,
                 "runtime_error": message,
+                "retrieval_strategy": "error",
+                "retrieval_confidence": 0.0,
             }
+        strategy = _retrieval_strategy(query, state.get("focus_sources", []))
         return {
             "attempt_count": attempt_count,
             "retrieved_chunks": [chunk.model_dump() for chunk in chunks],
             "runtime_error": "",
+            "retrieval_strategy": strategy,
+            "retrieval_confidence": _retrieval_confidence(chunks),
         }
 
     def _generate(self, state: RagState) -> RagState:
@@ -204,7 +243,8 @@ class SelfHealingRag:
             notes = list(state.get("error_notes", []))
             notes.append(message)
             return {"answer": FALLBACK_ANSWER, "error_notes": notes, "runtime_error": message}
-        return {"answer": answer.strip() or FALLBACK_ANSWER}
+        normalized = normalize_answer_citations(answer.strip() or FALLBACK_ANSWER, chunks)
+        return {"answer": normalized}
 
     def _critique(self, state: RagState) -> RagState:
         chunks = _chunks_from_state(state)
@@ -229,6 +269,8 @@ class SelfHealingRag:
             critic_reason=critic.reason,
             missing_claims=critic.missing_claims,
             invalid_citations=critic.invalid_citations,
+            retrieval_strategy=state.get("retrieval_strategy", "vector"),
+            retrieval_confidence=state.get("retrieval_confidence"),
         )
         return {
             "critic": critic.model_dump(),
@@ -254,8 +296,8 @@ class SelfHealingRag:
             notes = list(state.get("error_notes", []))
             notes.append(f"Query reformulation failed: {exc}")
             rewritten = f"{state['question']} {critic.reason}".strip()
-            return {"current_query": rewritten, "error_notes": notes}
-        return {"current_query": rewritten.strip() or state["question"]}
+            return {"current_query": sanitize_retrieval_query(rewritten), "error_notes": notes}
+        return {"current_query": sanitize_retrieval_query(rewritten) or state["question"]}
 
     def _finalize(self, state: RagState) -> RagState:
         critic = CriticResult.model_validate(state.get("critic", {"accepted": False, "reason": "Missing critic result."}))
@@ -274,11 +316,19 @@ def _response_from_state(state: RagState, thread_id: str) -> AskResponse:
             citations=[],
             attempts=attempts,
             thread_id=thread_id,
+            focus_sources=state.get("focus_sources", []),
         )
 
     answer = state.get("answer", FALLBACK_ANSWER)
     citations = _citations_for_answer(answer, _chunks_from_state(state))
-    return AskResponse(status="answered", answer=answer, citations=citations, attempts=attempts, thread_id=thread_id)
+    return AskResponse(
+        status="answered",
+        answer=answer,
+        citations=citations,
+        attempts=attempts,
+        thread_id=thread_id,
+        focus_sources=state.get("focus_sources", []),
+    )
 
 
 def _citations_for_answer(answer: str, chunks: list[RetrievedChunk]) -> list[Citation]:
@@ -302,3 +352,77 @@ def _message_content(content: object) -> str:
                 parts.append(str(item))
         return "\n".join(part for part in parts if part)
     return str(content)
+
+
+def is_overview_question(question: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", question.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+
+    overview_phrases = (
+        "what is this document about",
+        "what is the document about",
+        "what s this document about",
+        "whats this document about",
+        "what is this about",
+        "what s this about",
+        "whats this about",
+        "what is it about",
+        "what are these documents about",
+        "what is this file about",
+        "what is this pdf about",
+        "what s this pdf about",
+        "whats this pdf about",
+        "summarize this document",
+        "summarise this document",
+        "summarize this file",
+        "summarise this file",
+        "summarize this pdf",
+        "summarise this pdf",
+        "summarize the document",
+        "summarise the document",
+        "tell me about this document",
+        "tell me about this file",
+        "tell me about this pdf",
+        "give me an overview",
+        "document overview",
+        "main topic of this document",
+        "main idea of this document",
+    )
+    if any(phrase in normalized for phrase in overview_phrases):
+        return True
+
+    tokens = normalized.split()
+    if len(tokens) <= 10 and {"document", "about"}.issubset(tokens):
+        return True
+    if len(tokens) <= 10 and ("summary" in tokens or "summarize" in tokens or "summarise" in tokens):
+        return True
+    return False
+
+
+def sanitize_retrieval_query(query: str, *, max_length: int = 240) -> str:
+    sanitized = re.sub(r"^\s*(rewritten query|query|search query)\s*:\s*", "", query, flags=re.IGNORECASE)
+    sanitized = sanitized.strip().strip('"').strip("'")
+    sanitized = re.sub(r"\s+", " ", sanitized)
+    if len(sanitized) <= max_length:
+        return sanitized
+    truncated = sanitized[:max_length].rsplit(" ", 1)[0].strip()
+    return truncated or sanitized[:max_length].strip()
+
+
+def _retrieval_strategy(query: str, focus_sources: list[str]) -> str:
+    strategy = "overview" if is_overview_question(query) else "hybrid"
+    if focus_sources:
+        return f"focused-{strategy}"
+    return strategy
+
+
+def _retrieval_confidence(chunks: list[RetrievedChunk]) -> float:
+    if not chunks:
+        return 0.0
+    relevance_scores = [chunk.relevance for chunk in chunks if chunk.relevance is not None]
+    if relevance_scores:
+        top_scores = relevance_scores[: min(3, len(relevance_scores))]
+        return round(sum(top_scores) / len(top_scores), 3)
+    return 1.0

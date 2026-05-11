@@ -2,7 +2,7 @@ from fastapi.testclient import TestClient
 
 from self_healing_rag.api import app, get_rag_service
 from self_healing_rag.constants import FALLBACK_ANSWER
-from self_healing_rag.schemas import AskResponse, HealthResponse, IngestResponse
+from self_healing_rag.schemas import AskResponse, HealthResponse, IndexStats, IngestResponse
 
 
 class FakeService:
@@ -22,8 +22,18 @@ class FakeService:
     def ingest_upload(self, filename, content, *, collection=None):
         return IngestResponse(collection=collection or "default", chunks_added=1, sources=[f"upload:{filename}"], ids=["1"])
 
-    def ask(self, question, *, collection=None, max_attempts=None, thread_id=None):
-        return AskResponse(status="insufficient_info", answer=FALLBACK_ANSWER, citations=[], attempts=[], thread_id=thread_id or "t1")
+    def ask(self, question, *, collection=None, max_attempts=None, thread_id=None, focus_sources=None):
+        return AskResponse(
+            status="insufficient_info",
+            answer=FALLBACK_ANSWER,
+            citations=[],
+            attempts=[],
+            thread_id=thread_id or "t1",
+            focus_sources=focus_sources or [],
+        )
+
+    def collection_stats(self, collection=None):
+        return IndexStats(collection=collection or "default", chunk_count=1, source_count=1, sources=["doc.md"], is_empty=False)
 
 
 def client():
@@ -54,7 +64,16 @@ def test_upload_endpoint():
 
 
 def test_ask_endpoint():
-    response = client().post("/ask", json={"question": "What?", "collection": "docs", "thread_id": "thread"})
+    response = client().post(
+        "/ask",
+        json={"question": "What?", "collection": "docs", "thread_id": "thread", "focus_sources": ["doc.md"]},
+    )
     assert response.status_code == 200
     assert response.json()["thread_id"] == "thread"
+    assert response.json()["focus_sources"] == ["doc.md"]
 
+
+def test_collection_stats_endpoint():
+    response = client().get("/collections/docs/stats")
+    assert response.status_code == 200
+    assert response.json()["chunk_count"] == 1

@@ -1,4 +1,4 @@
-from self_healing_rag.streamlit_app import _attempt_summary, _page_label, _source_lines
+from self_healing_rag.streamlit_app import _attempt_summary, _page_label, _percent_label, _score_label, _source_lines
 
 
 def test_source_lines_ignores_blank_lines():
@@ -24,3 +24,13 @@ def test_attempt_summary_includes_verdict_and_query():
     assert "Attempt 2" in summary
     assert "rejected" in summary
     assert "retry query" in summary
+
+
+def test_score_label_formats_optional_score():
+    assert _score_label(None) == ""
+    assert _score_label(0.123456) == "0.1235"
+
+
+def test_percent_label_formats_optional_confidence():
+    assert _percent_label(None) == "confidence n/a"
+    assert _percent_label(0.874) == "87% confidence"

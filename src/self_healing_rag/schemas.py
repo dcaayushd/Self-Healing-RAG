@@ -13,6 +13,7 @@ class Citation(BaseModel):
     page: int | None = None
     chunk_index: int
     score: float | None = None
+    relevance: float | None = None
     excerpt: str
 
 
@@ -25,6 +26,8 @@ class AttemptTrace(BaseModel):
     critic_reason: str
     missing_claims: list[str] = Field(default_factory=list)
     invalid_citations: list[str] = Field(default_factory=list)
+    retrieval_strategy: str = "vector"
+    retrieval_confidence: float | None = None
 
 
 class CriticResult(BaseModel):
@@ -62,6 +65,7 @@ class AskRequest(BaseModel):
     collection: str = "default"
     max_attempts: int = Field(default=3, ge=1)
     thread_id: str | None = None
+    focus_sources: list[str] = Field(default_factory=list)
 
 
 class AskResponse(BaseModel):
@@ -70,6 +74,7 @@ class AskResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     attempts: list[AttemptTrace] = Field(default_factory=list)
     thread_id: str
+    focus_sources: list[str] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -81,6 +86,16 @@ class HealthResponse(BaseModel):
     embedding_model: str
 
 
+class IndexStats(BaseModel):
+    collection: str
+    chunk_count: int
+    source_count: int
+    sources: list[str] = Field(default_factory=list)
+    source_types: list[str] = Field(default_factory=list)
+    embedding_model: str | None = None
+    is_empty: bool = True
+
+
 class RetrievedChunk(BaseModel):
     id: str
     content: str
@@ -90,6 +105,8 @@ class RetrievedChunk(BaseModel):
     page: int | None = None
     chunk_index: int
     score: float | None = None
+    relevance: float | None = None
+    retrieval_rank: int | None = None
     citation_id: str
 
     def to_citation(self) -> Citation:
@@ -101,6 +118,7 @@ class RetrievedChunk(BaseModel):
             page=self.page,
             chunk_index=self.chunk_index,
             score=self.score,
+            relevance=self.relevance,
             excerpt=self.content[:500],
         )
 
@@ -113,4 +131,3 @@ def insufficient_response(thread_id: str, attempts: list[AttemptTrace] | None = 
         attempts=attempts or [],
         thread_id=thread_id,
     )
-

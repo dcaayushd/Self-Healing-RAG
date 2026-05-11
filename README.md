@@ -2,12 +2,86 @@
 
 A local Retrieval-Augmented Generation pipeline that retrieves evidence, generates an answer, critiques whether the answer is grounded in the retrieved chunks, and retries with a reformulated query before returning a safe fallback.
 
-The graph is modeled with LangGraph as a cyclical workflow:
+The graph is modeled with LangGraph as a cyclical workflow. It is designed for local development with Ollama, Chroma, FastAPI, Typer, and Streamlit.
 
-```text
-retrieve -> generate -> critique -> reformulate -> retrieve
-                              \-> finalize
+## Architecture
+
+```mermaid
+flowchart LR
+    User[User] --> UI[Streamlit UI]
+    User --> CLI[Typer CLI]
+    User --> API[FastAPI API]
+
+    UI --> Service[RAG Service]
+    CLI --> Service
+    API --> Service
+
+    Service --> Graph[LangGraph StateGraph]
+    Service --> Ingest[Ingestion Pipeline]
+    Ingest --> Split[Load + Split + Metadata]
+    Split --> Embed[Ollama Embeddings]
+    Embed --> Chroma[(Persistent Chroma)]
+
+    Graph --> Retrieve[Retriever]
+    Retrieve --> Chroma
+    Graph --> Generate[Ollama Chat Model]
+    Graph --> Critic[Grounding Critic]
+    Graph --> Checkpoint[(SQLite Checkpoints)]
 ```
+
+## Self-Healing Workflow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Retrieve
+    Retrieve --> Generate: chunks found
+    Retrieve --> Finalize: runtime failure
+    Generate --> Critique
+    Critique --> Finalize: grounded answer
+    Critique --> Reformulate: rejected + attempts remain
+    Reformulate --> Retrieve
+    Critique --> Finalize: rejected + attempts exhausted
+    Finalize --> [*]
+```
+
+## Ingestion Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as Service
+    participant L as Loaders
+    participant E as Ollama Embeddings
+    participant C as Chroma
+
+    U->>S: ingest PDF, docs folder, or exact URL
+    S->>L: load supported content
+    L->>L: split into overlapping chunks
+    L->>L: attach deterministic IDs and citation metadata
+    S->>E: embed chunks
+    E-->>S: vectors
+    S->>C: upsert chunks and metadata
+    C-->>S: stored IDs
+```
+
+## Ask Flow
+
+```mermaid
+flowchart TD
+    Q[Question] --> R{Question type}
+    R -->|Specific| VS[Vector similarity search]
+    R -->|Broad overview| OV[Representative collection overview]
+    VS --> CTX[Retrieved evidence chunks]
+    OV --> CTX
+    CTX --> A[Generate cited answer]
+    A --> C{Critic grounded?}
+    C -->|Yes| OK[Return answer + citations]
+    C -->|No, attempts remain| RW[Reformulate query]
+    RW --> R
+    C -->|No, exhausted| NA[Return insufficient-information fallback]
+```
+
+The overview retrieval path is what makes questions like `What is this document about?` work reliably. It retrieves representative chunks from the indexed collection instead of asking the vector store to infer intent from a vague query.
 
 ## Setup
 
@@ -31,14 +105,32 @@ In another terminal:
 rag doctor
 ```
 
+Expected healthy output:
+
+```text
+ok   python: 3.13.7
+ok   chroma_path: data/chroma
+ok   checkpoint_db: data/checkpoints.sqlite
+ok   ollama_server: 200 OK
+ok   chat_model: llama3:latest
+ok   embedding_model: nomic-embed-text
+```
+
 ## CLI
 
-Put documents in `data/docs` first, or use the included sample document:
+Put documents in `data/docs` first, or upload documents in the Streamlit UI:
 
 ```bash
 rag ingest ./data/docs --collection default
+rag ask "What is this document about?" --collection default
 rag ask "What does the document say about retries?" --collection default
 rag reset --collection default
+```
+
+For precise document-focused questions, pass the exact source shown in the UI source picker or the collection stats API:
+
+```bash
+rag ask "What is this document about?" --source "upload:paper.pdf" --collection default
 ```
 
 You can also ingest one exact URL:
@@ -64,7 +156,9 @@ rag ui
 
 Then open `http://127.0.0.1:8501`.
 
-The sidebar supports PDF/TXT/Markdown/HTML uploads, server-local paths, exact single-page URLs, collection reset, and retry limit control. The chat panel shows the final answer, citations, and critic attempt history.
+The UI is chat-first. The sidebar handles PDF/TXT/Markdown/HTML upload ingestion, server-local path ingestion, exact single-page URL ingestion, source selection, collection reset, and runtime checks.
+
+`Sources to search` is the retrieval scope. Use one selected source when you ask vague questions like `What is this document about?`; keep several selected when you want the answer synthesized across multiple indexed documents.
 
 ## API
 
@@ -78,6 +172,8 @@ curl -X POST http://127.0.0.1:8000/ingest \
 curl -X POST http://127.0.0.1:8000/ask \
   -H "content-type: application/json" \
   -d '{"question":"What does the document say about retries?","collection":"default","max_attempts":3}'
+
+curl http://127.0.0.1:8000/collections/default/stats
 ```
 
 Upload ingestion supports PDF, TXT, Markdown, and HTML:

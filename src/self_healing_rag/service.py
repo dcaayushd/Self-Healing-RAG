@@ -5,7 +5,7 @@ from functools import lru_cache
 from self_healing_rag.config import Settings, get_settings
 from self_healing_rag.graph import OllamaRagComponents, SelfHealingRag
 from self_healing_rag.loaders import load_and_chunk_sources, load_and_chunk_upload
-from self_healing_rag.schemas import AskResponse, HealthResponse, IngestResponse
+from self_healing_rag.schemas import AskResponse, HealthResponse, IndexStats, IngestResponse
 from self_healing_rag.vector_store import VectorStoreManager
 
 
@@ -23,7 +23,8 @@ class RagService:
         target_collection = collection or self.settings.default_collection
         docs = load_and_chunk_sources(sources, self.settings, collection=target_collection)
         ids = self.vector_store.add_documents(docs, collection=target_collection)
-        return IngestResponse(collection=target_collection, chunks_added=len(ids), sources=sources, ids=ids)
+        actual_sources = sorted({str(doc.metadata.get("source", "unknown")) for doc in docs})
+        return IngestResponse(collection=target_collection, chunks_added=len(ids), sources=actual_sources, ids=ids)
 
     def ingest_upload(self, filename: str, content: bytes, *, collection: str | None = None) -> IngestResponse:
         target_collection = collection or self.settings.default_collection
@@ -38,11 +39,24 @@ class RagService:
         collection: str | None = None,
         max_attempts: int | None = None,
         thread_id: str | None = None,
+        focus_sources: list[str] | None = None,
     ) -> AskResponse:
-        return self.engine.ask(question, collection=collection, max_attempts=max_attempts, thread_id=thread_id)
+        return self.engine.ask(
+            question,
+            collection=collection,
+            max_attempts=max_attempts,
+            thread_id=thread_id,
+            focus_sources=focus_sources,
+        )
 
     def reset_collection(self, collection: str | None = None) -> None:
         self.vector_store.delete_collection(collection or self.settings.default_collection)
+
+    def delete_sources(self, sources: list[str], *, collection: str | None = None) -> int:
+        return self.vector_store.delete_sources(collection or self.settings.default_collection, sources)
+
+    def collection_stats(self, collection: str | None = None) -> IndexStats:
+        return self.vector_store.collection_stats(collection or self.settings.default_collection)
 
     def health(self) -> HealthResponse:
         return HealthResponse(

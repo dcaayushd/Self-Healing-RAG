@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from html import escape
+import json
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -20,6 +22,7 @@ SAMPLE_QUESTIONS = [
     "What are the key facts?",
     "What should I know first?",
 ]
+MAX_CHAT_LOGS = 50
 
 
 @st.cache_resource(show_spinner=False)
@@ -27,12 +30,17 @@ def get_service() -> RagService:
     return RagService()
 
 
+@st.cache_resource(show_spinner=False)
+def get_app_boot_id() -> str:
+    return uuid4().hex
+
+
 def main() -> None:
     st.set_page_config(page_title="Self-Healing RAG", page_icon="SH", layout="wide")
-    _init_state()
+    settings = get_settings()
+    _init_state(settings, app_boot_id=get_app_boot_id())
     _apply_theme(st.session_state.theme_mode)
 
-    settings = get_settings()
     service = get_service()
     collection, max_attempts, stats, focus_sources = _render_sidebar(service, settings)
     _render_chat_page(
@@ -47,11 +55,14 @@ def main() -> None:
 def _render_sidebar(service: RagService, settings: Settings) -> tuple[str, int, IndexStats, list[str]]:
     with st.sidebar:
         _render_sidebar_brand()
+        _render_notice()
         _render_chat_logs()
         st.divider()
 
         st.markdown("### Knowledge")
-        collection = st.text_input("Collection", value=settings.default_collection)
+        collection = st.session_state.chat_collection
+        st.text_input("Workspace", value=_workspace_label(collection), disabled=True)
+        st.caption("Each new chat starts with a clean document workspace.")
         stats = _safe_stats(service, collection)
 
         with st.expander("Sources to search", expanded=not stats.is_empty):
@@ -66,8 +77,9 @@ def _render_sidebar(service: RagService, settings: Settings) -> tuple[str, int, 
         st.selectbox("Theme", ["Auto", "Light", "Dark"], key="theme_mode")
         max_attempts = st.slider("Healing attempts", min_value=1, max_value=6, value=settings.max_attempts)
         if st.button("New chat", width="stretch"):
-            st.session_state.messages = []
-            st.session_state.thread_id = str(uuid4())
+            _save_current_chat_session()
+            _start_blank_chat(reset_source_scope_widget=False)
+            st.session_state.reset_source_scope_mode = True
             st.rerun()
         st.caption(f"Thread `{st.session_state.thread_id}`")
 
@@ -84,6 +96,7 @@ def _render_sidebar(service: RagService, settings: Settings) -> tuple[str, int, 
                     st.session_state.ingest_events = []
                     st.session_state.focus_sources = []
                     st.session_state.upload_key += 1
+                    _remove_current_chat_session()
                     st.success(f"Reset `{collection}`.")
                     st.rerun()
                 except Exception as exc:
@@ -112,14 +125,15 @@ def _render_chat_page(
         unsafe_allow_html=True,
     )
 
+    pending_prompt = st.session_state.pop("pending_prompt", None)
+
     if stats.is_empty:
         st.info("Add documents from the left sidebar to start a grounded chat.")
-    elif not st.session_state.messages:
+    elif not st.session_state.messages and not pending_prompt:
         _render_empty_chat_suggestions(stats)
 
     _render_chat_history()
 
-    pending_prompt = st.session_state.pop("pending_prompt", None)
     if pending_prompt:
         _submit_prompt(
             service,
@@ -131,6 +145,9 @@ def _render_chat_page(
         return
 
     prompt = _render_prompt_input(disabled=stats.is_empty)
+
+    st.markdown("<div style='height: 16rem;'></div>", unsafe_allow_html=True)
+
     if prompt:
         st.session_state.pending_prompt = prompt
         st.rerun()
@@ -171,7 +188,6 @@ def _submit_prompt(
     focus_sources: list[str],
 ) -> None:
     st.session_state.messages.append({"role": "user", "content": prompt})
-    _record_chat_log(prompt)
     _render_user_bubble(prompt)
     thinking = st.empty()
     thinking.markdown(
@@ -183,6 +199,7 @@ def _submit_prompt(
         ),
         unsafe_allow_html=True,
     )
+    st.markdown("<div style='height: 16rem;'></div>", unsafe_allow_html=True)
     try:
         response = service.ask(
             prompt,
@@ -207,6 +224,7 @@ def _submit_prompt(
             }
         )
     thinking.empty()
+    _record_chat_log(prompt)
     st.rerun()
 
 
@@ -224,24 +242,32 @@ def _render_upload_ingest(
         key=f"{key_prefix}_{st.session_state.upload_key}",
         label_visibility="visible",
     )
+    selected_uploads = list(uploaded_files or [])
     if compact:
         st.caption("PDF, TXT, Markdown, and HTML files. The picker resets after indexing.")
+    if selected_uploads:
+        st.caption(f"Ready to index {_pluralize(len(selected_uploads), 'selected file')}.")
+    button_label = (
+        f"Index {_pluralize(len(selected_uploads), 'selected file')}"
+        if selected_uploads
+        else ("Ingest uploads" if not compact else "Index selected files")
+    )
     if st.button(
-        "Ingest uploads" if not compact else "Index selected files",
-        disabled=not uploaded_files,
+        button_label,
+        disabled=not selected_uploads,
         width="stretch",
         key=f"{key_prefix}_button_{st.session_state.upload_key}",
     ):
         responses: list[IngestResponse] = []
         try:
             with st.spinner("Embedding uploaded files..."):
-                for uploaded in uploaded_files or []:
+                for uploaded in selected_uploads:
                     responses.append(service.ingest_upload(uploaded.name, uploaded.getvalue(), collection=collection))
             _record_ingest(responses)
             chunks = sum(response.chunks_added for response in responses)
             _set_focus_sources([source for response in responses for source in response.sources])
             st.session_state.upload_key += 1
-            st.success(f"Ingested {chunks} chunks from {len(responses)} uploaded file(s).")
+            _set_notice("success", f"Indexed {chunks} chunks from {_pluralize(len(responses), 'uploaded file')}.")
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
@@ -322,12 +348,14 @@ def _render_answer_meta(response: dict[str, Any]) -> None:
     confidence = _percent_label(final_attempt.get("retrieval_confidence"))
     strategy = final_attempt.get("retrieval_strategy", "hybrid")
     citations = len(response.get("citations") or [])
+    latency = _ms_label(response.get("total_ms") or final_attempt.get("total_ms"))
     st.markdown(
         (
             "<div class='answer-meta'>"
             f"<span>{escape(status)}</span>"
             f"<span>{escape(strategy)}</span>"
             f"<span>{escape(confidence)}</span>"
+            f"<span>{escape(latency)}</span>"
             f"<span>{citations} citation(s)</span>"
             "</div>"
         ),
@@ -359,7 +387,6 @@ def _render_citations(citations: list[dict[str, Any]]) -> None:
     if not citations:
         return
     with st.expander("Evidence citations", expanded=True):
-        st.markdown("<div class='citation-list'>", unsafe_allow_html=True)
         for item in citations:
             page = _page_label(item.get("page")) or "n/a"
             relevance = _score_label(item.get("relevance")) or "n/a"
@@ -373,7 +400,6 @@ def _render_citations(citations: list[dict[str, Any]]) -> None:
                 ),
                 unsafe_allow_html=True,
             )
-        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_attempts(attempts: list[dict[str, Any]]) -> None:
@@ -400,12 +426,12 @@ def _render_attempts(attempts: list[dict[str, Any]]) -> None:
 
 
 def _render_chat_logs() -> None:
-    logs = st.session_state.get("chat_logs", [])
+    logs = _chat_log_entries()
     st.markdown(
         (
             "<div class='logs-header'>"
             "<div><strong>Chat logs</strong></div>"
-            f"<span>{len(logs)}/50</span>"
+            f"<span>{len(logs)}/{MAX_CHAT_LOGS}</span>"
             "</div>"
         ),
         unsafe_allow_html=True,
@@ -414,14 +440,19 @@ def _render_chat_logs() -> None:
         st.caption("Recent questions will appear here.")
         return
 
-    for idx, prompt in enumerate(reversed(logs[-12:])):
-        label = _short_label(prompt)
-        if st.button(label, key=f"chat_log_{idx}_{hash(prompt)}", width="stretch"):
-            st.session_state.pending_prompt = prompt
+    for entry in reversed(logs[-12:]):
+        label = _short_label(entry["title"])
+        if st.button(label, key=f"chat_log_{entry['id']}", width="stretch"):
+            _save_current_chat_session()
+            _load_chat_session(entry["id"])
             st.rerun()
 
     if st.button("Clear history", key="clear_chat_logs", width="stretch"):
-        st.session_state.chat_logs = []
+        active_id = st.session_state.active_chat_id
+        current = st.session_state.chat_sessions.get(active_id)
+        st.session_state.chat_sessions = {active_id: current} if current else {}
+        st.session_state.chat_order = [active_id] if current else []
+        _persist_chat_sessions()
         st.rerun()
 
 
@@ -440,6 +471,26 @@ def _render_sidebar_brand() -> None:
     )
 
 
+def _render_notice() -> None:
+    notice = st.session_state.pop("notice", None)
+    if not notice:
+        return
+    message = str(notice.get("message", ""))
+    kind = str(notice.get("kind", "info"))
+    if kind == "success":
+        st.success(message)
+    elif kind == "warning":
+        st.warning(message)
+    elif kind == "error":
+        st.error(message)
+    else:
+        st.info(message)
+
+
+def _set_notice(kind: str, message: str) -> None:
+    st.session_state.notice = {"kind": kind, "message": message}
+
+
 def _run_action(label: str, func, *args, **kwargs):
     with st.spinner(label):
         return func(*args, **kwargs)
@@ -456,6 +507,63 @@ def _record_ingest(responses: list[IngestResponse]) -> None:
         )
 
 
+def _chat_log_entries() -> list[dict[str, Any]]:
+    active_id = st.session_state.get("active_chat_id")
+    sessions = st.session_state.get("chat_sessions", {})
+    entries: list[dict[str, Any]] = []
+    for session_id in st.session_state.get("chat_order", []):
+        if session_id == active_id:
+            continue
+        session = sessions.get(session_id)
+        if session and session.get("messages"):
+            entries.append(session)
+    return entries
+
+
+def _save_current_chat_session(title_hint: str | None = None) -> None:
+    messages = list(st.session_state.get("messages", []))
+    if not messages:
+        return
+
+    session_id = st.session_state.active_chat_id
+    sessions = dict(st.session_state.get("chat_sessions", {}))
+    previous = sessions.get(session_id, {})
+    title = previous.get("title") or _session_title(messages, title_hint=title_hint)
+    sessions[session_id] = {
+        "id": session_id,
+        "title": title,
+        "collection": st.session_state.chat_collection,
+        "thread_id": st.session_state.thread_id,
+        "messages": messages,
+        "focus_sources": list(st.session_state.get("focus_sources", [])),
+    }
+    order = [item for item in st.session_state.get("chat_order", []) if item != session_id]
+    order.append(session_id)
+    st.session_state.chat_sessions = {item: sessions[item] for item in order[-MAX_CHAT_LOGS:] if item in sessions}
+    st.session_state.chat_order = order[-MAX_CHAT_LOGS:]
+    _persist_chat_sessions()
+
+
+def _load_chat_session(session_id: str) -> None:
+    session = st.session_state.chat_sessions.get(session_id)
+    if not session:
+        return
+    st.session_state.active_chat_id = session_id
+    st.session_state.chat_collection = str(session["collection"])
+    st.session_state.thread_id = str(session["thread_id"])
+    st.session_state.messages = list(session.get("messages", []))
+    st.session_state.focus_sources = list(session.get("focus_sources", []))
+    st.session_state.pending_prompt = None
+    st.session_state.upload_key += 1
+
+
+def _remove_current_chat_session() -> None:
+    session_id = st.session_state.active_chat_id
+    st.session_state.chat_sessions.pop(session_id, None)
+    st.session_state.chat_order = [item for item in st.session_state.chat_order if item != session_id]
+    _persist_chat_sessions()
+
+
 def _set_focus_sources(sources: list[str]) -> None:
     filtered = [source for source in sources if source]
     if filtered:
@@ -463,12 +571,7 @@ def _set_focus_sources(sources: list[str]) -> None:
 
 
 def _record_chat_log(prompt: str) -> None:
-    normalized = prompt.strip()
-    if not normalized:
-        return
-    logs = [item for item in st.session_state.get("chat_logs", []) if item != normalized]
-    logs.append(normalized)
-    st.session_state.chat_logs = logs[-50:]
+    _save_current_chat_session(title_hint=prompt)
 
 
 def _render_source_scope(stats: IndexStats) -> list[str]:
@@ -520,15 +623,96 @@ def _safe_stats(service: RagService, collection: str) -> IndexStats:
         return IndexStats(collection=collection, chunk_count=0, source_count=0)
 
 
-def _init_state() -> None:
+def _init_state(settings: Settings, *, app_boot_id: str) -> None:
+    st.session_state.setdefault("theme_mode", "Auto")
+    st.session_state.setdefault("source_scope_mode", "All indexed sources")
+    st.session_state.setdefault("upload_key", 0)
+    st.session_state.chat_log_path = _chat_log_path(settings)
+    if st.session_state.pop("reset_source_scope_mode", False):
+        st.session_state.source_scope_mode = "All indexed sources"
+
+    if not st.session_state.get("_chat_logs_loaded"):
+        sessions, order = _load_persisted_chat_sessions(st.session_state.chat_log_path)
+        st.session_state.chat_sessions = sessions
+        st.session_state.chat_order = order
+        st.session_state._chat_logs_loaded = True
+
+    if st.session_state.get("app_boot_id") != app_boot_id or "active_chat_id" not in st.session_state:
+        _start_blank_chat()
+        st.session_state.app_boot_id = app_boot_id
+        return
+
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("thread_id", str(uuid4()))
     st.session_state.setdefault("ingest_events", [])
     st.session_state.setdefault("focus_sources", [])
-    st.session_state.setdefault("upload_key", 0)
-    st.session_state.setdefault("chat_logs", [])
-    st.session_state.setdefault("theme_mode", "Auto")
-    st.session_state.setdefault("source_scope_mode", "All indexed sources")
+    st.session_state.setdefault("chat_collection", _new_chat_collection())
+    st.session_state.setdefault("chat_sessions", {})
+    st.session_state.setdefault("chat_order", [])
+
+
+def _start_blank_chat(*, reset_source_scope_widget: bool = True) -> None:
+    st.session_state.active_chat_id = uuid4().hex
+    st.session_state.chat_collection = _new_chat_collection()
+    st.session_state.thread_id = str(uuid4())
+    st.session_state.messages = []
+    st.session_state.ingest_events = []
+    st.session_state.focus_sources = []
+    st.session_state.pending_prompt = None
+    if reset_source_scope_widget:
+        st.session_state.source_scope_mode = "All indexed sources"
+    st.session_state.upload_key = int(st.session_state.get("upload_key", 0)) + 1
+
+
+def _load_persisted_chat_sessions(path: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}, []
+
+    sessions = data.get("sessions", {})
+    order = data.get("order", [])
+    if not isinstance(sessions, dict) or not isinstance(order, list):
+        return {}, []
+    cleaned = {str(key): value for key, value in sessions.items() if isinstance(value, dict)}
+    cleaned_order = [str(item) for item in order if str(item) in cleaned]
+    return cleaned, cleaned_order[-MAX_CHAT_LOGS:]
+
+
+def _persist_chat_sessions() -> None:
+    path = st.session_state.get("chat_log_path")
+    if not path:
+        return
+    payload = {
+        "order": st.session_state.get("chat_order", [])[-MAX_CHAT_LOGS:],
+        "sessions": st.session_state.get("chat_sessions", {}),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _chat_log_path(settings: Settings) -> Path:
+    return settings.checkpoint_db.parent / "ui_chat_logs.json"
+
+
+def _new_chat_collection() -> str:
+    return f"ui_{uuid4().hex[:24]}"
+
+
+def _workspace_label(collection: str) -> str:
+    return f"Chat workspace {collection.removeprefix('ui_')[:8]}"
+
+
+def _session_title(messages: list[dict[str, Any]], *, title_hint: str | None = None) -> str:
+    for message in messages:
+        if message.get("role") == "user" and message.get("content"):
+            return _short_label(str(message["content"]), limit=44)
+    if title_hint:
+        return _short_label(title_hint, limit=44)
+    return "Untitled chat"
 
 
 def _apply_theme(mode: str = "Auto") -> None:
@@ -587,7 +771,7 @@ def _apply_theme(mode: str = "Auto") -> None:
             max-width: none;
             min-height: 100vh;
             margin: 0;
-            padding: 1.9rem 1.65rem 8.5rem 1.65rem;
+            padding: calc(7.5rem + 5px) 1.65rem 4rem 1.65rem !important;
             background: var(--rag-bg);
             border: 0;
             border-radius: 0;
@@ -602,10 +786,10 @@ def _apply_theme(mode: str = "Auto") -> None:
         }
         section[data-testid="stSidebar"] > div:first-child {
             width: 320px !important;
-            padding: 1rem 1.15rem 7rem 1.15rem;
+            padding: 5.2rem 1.15rem 7rem 1.15rem;
         }
         section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
-            padding-top: 1rem !important;
+            padding-top: 0.35rem !important;
         }
         section[data-testid="stSidebar"] * {
             color: var(--rag-text);
@@ -667,11 +851,14 @@ def _apply_theme(mode: str = "Auto") -> None:
             align-items: flex-end;
             justify-content: space-between;
             gap: 1rem;
-            position: sticky;
+            position: fixed;
             top: 0;
+            left: 320px;
+            right: 0;
             z-index: 900;
-            padding: 0.75rem 0 0.75rem 0;
-            background: linear-gradient(180deg, var(--rag-bg) 78%, color-mix(in srgb, var(--rag-bg) 0%, transparent));
+            padding: 1.9rem 1.65rem 1rem 1.65rem;
+            background: var(--rag-bg);
+            border-bottom: 1px solid var(--rag-border);
         }
         .chat-header h1 {
             color: var(--rag-text);
@@ -752,6 +939,7 @@ def _apply_theme(mode: str = "Auto") -> None:
             border: 1px solid var(--rag-border);
             border-radius: 18px 18px 18px 4px;
             padding: 0.92rem 1rem;
+            margin-bottom: 20px;
             box-shadow: var(--rag-shadow);
             line-height: 1.52;
         }
@@ -763,7 +951,7 @@ def _apply_theme(mode: str = "Auto") -> None:
             display: flex;
             flex-wrap: wrap;
             gap: 0.4rem;
-            margin: -0.35rem 0 0.85rem 2.65rem;
+            margin: 0 0 0.85rem 2.65rem;
         }
         .answer-meta span {
             border: 1px solid var(--rag-border);
@@ -792,22 +980,30 @@ def _apply_theme(mode: str = "Auto") -> None:
             50% { transform: scale(1); opacity: 1; }
         }
         div[data-testid="stChatInput"] {
-            position: fixed;
-            left: 344px !important;
-            right: 1.5rem !important;
-            bottom: 1rem !important;
-            width: auto !important;
-            max-width: none !important;
+            padding: 0;
+            background: transparent;
             z-index: 1000;
-            padding: 0.75rem 0;
-            background: linear-gradient(180deg, color-mix(in srgb, var(--rag-bg) 8%, transparent), var(--rag-bg) 46%);
         }
         div[data-testid="stChatInput"] > div {
             border: 1px solid var(--rag-border);
             border-radius: 16px;
             background: var(--rag-panel);
-            padding: 0.35rem;
-            box-shadow: var(--rag-shadow);
+            padding: 0.35rem 0.65rem;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+        }
+        [data-testid="stBottom"] {
+            position: fixed !important;
+            bottom: 0 !important;
+            left: 320px !important;
+            right: 0 !important;
+            background: var(--rag-bg) !important;
+            padding: 1rem 1.65rem 1.4rem 1.65rem !important;
+            border-top: 1px solid var(--rag-border);
+            z-index: 999;
+        }
+        [data-testid="stBottomBlockContainer"] {
+            background: transparent !important;
+            padding: 0 !important;
         }
         div[data-testid="stChatInput"] textarea {
             border-radius: 999px;
@@ -908,17 +1104,24 @@ def _apply_theme(mode: str = "Auto") -> None:
                 width: min(88vw, 320px) !important;
                 min-width: min(88vw, 320px) !important;
             }
+            .chat-header {
+                left: 0;
+                padding-top: 3.5rem;
+            }
             .block-container {
                 border-radius: 0;
                 min-height: 100vh;
-                padding-top: 3.5rem;
+                padding-top: 11.5rem;
+                padding-bottom: 2rem !important;
                 padding-left: 1rem;
                 padding-right: 1rem;
             }
-            div[data-testid="stChatInput"] {
-                left: 1rem;
-                right: 1rem;
-                bottom: 0.75rem;
+            [data-testid="stBottom"] {
+                left: 0 !important;
+                padding: 1rem 1rem 1.4rem 1rem !important;
+            }
+            [data-testid="stBottomBlockContainer"] {
+                padding: 0 !important;
             }
             .attempt-card { grid-template-columns: 1fr; }
         }
@@ -995,6 +1198,17 @@ def _percent_label(score: float | None) -> str:
     if score is None:
         return "confidence n/a"
     return f"{round(score * 100)}% confidence"
+
+
+def _ms_label(value: float | int | None) -> str:
+    if value is None:
+        return "latency n/a"
+    return f"{round(float(value))} ms"
+
+
+def _pluralize(count: int, singular: str) -> str:
+    suffix = "" if count == 1 else "s"
+    return f"{count} {singular}{suffix}"
 
 
 def _short_label(text: str, *, limit: int = 38) -> str:

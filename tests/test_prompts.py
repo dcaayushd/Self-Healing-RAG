@@ -72,6 +72,17 @@ def test_parse_critic_rejects_unsupported_cited_sentence():
     assert any("Unsupported cited sentence" in claim for claim in result.missing_claims)
 
 
+def test_parse_critic_rejects_missing_required_surface_fact():
+    result = parse_critic_json(
+        '{"accepted": true, "reason": "ok", "missing_claims": [], "invalid_citations": []}',
+        answer="The document describes a grounded RAG workflow in 2026 [C1].",
+        chunks=[chunk()],
+    )
+
+    assert not result.accepted
+    assert any("Unsupported cited sentence" in claim for claim in result.missing_claims)
+
+
 def test_normalize_answer_citations_uses_best_matching_chunk_for_bullets():
     answer = "Topics include:\n\n* Hantavirus infection symptoms"
 

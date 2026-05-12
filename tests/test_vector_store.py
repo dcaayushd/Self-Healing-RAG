@@ -3,7 +3,12 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
 from self_healing_rag.config import Settings
-from self_healing_rag.vector_store import VectorStoreManager, _select_diverse_results, _select_ranked_results
+from self_healing_rag.vector_store import (
+    VectorStoreManager,
+    _needs_lexical_fallback,
+    _select_diverse_results,
+    _select_ranked_results,
+)
 
 
 class FakeEmbeddings(Embeddings):
@@ -122,6 +127,165 @@ def test_hybrid_ranker_promotes_lexically_relevant_result():
 
     assert selected[0].document.metadata["chunk_id"] == "b"
     assert selected[0].relevance > 0
+
+
+def test_search_uses_lexical_fallback_when_vector_fetch_is_too_narrow(tmp_path):
+    settings = Settings(
+        chroma_path=tmp_path / "chroma",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        max_lexical_scan=100,
+    )
+    manager = VectorStoreManager(settings, embedding=FakeEmbeddings())
+    docs = [
+        Document(
+            page_content="generic setup notes",
+            metadata={
+                "chunk_id": "generic",
+                "source": "a.md",
+                "source_type": "markdown",
+                "page": -1,
+                "chunk_index": 0,
+                "content_hash": "a",
+                "embedding_model": settings.embedding_model,
+                "citation_label": "a.md",
+            },
+        ),
+        Document(
+            page_content="needlephrase incident response runbook",
+            metadata={
+                "chunk_id": "target",
+                "source": "b.md",
+                "source_type": "markdown",
+                "page": -1,
+                "chunk_index": 0,
+                "content_hash": "b",
+                "embedding_model": settings.embedding_model,
+                "citation_label": "b.md",
+            },
+        ),
+    ]
+    manager.add_documents(docs, collection="default")
+
+    chunks = manager.search("needlephrase", collection="default", top_k=1, fetch_k=1)
+
+    assert chunks[0].id == "target"
+
+
+def test_lexical_fallback_is_skipped_when_vector_results_cover_query():
+    vector_results = [
+        (
+            Document(
+                page_content="needlephrase incident response runbook",
+                metadata={"chunk_id": "target", "source": "runbook.md", "citation_label": "runbook.md"},
+            ),
+            0.1,
+        )
+    ]
+
+    assert not _needs_lexical_fallback("needlephrase response runbook", vector_results, top_k=1)
+
+
+def test_lexical_fallback_is_used_when_vector_results_do_not_cover_query():
+    vector_results = [
+        (
+            Document(
+                page_content="generic setup notes",
+                metadata={"chunk_id": "generic", "source": "setup.md", "citation_label": "setup.md"},
+            ),
+            0.1,
+        )
+    ]
+
+    assert _needs_lexical_fallback("needlephrase response runbook", vector_results, top_k=1)
+
+
+def test_search_cache_returns_defensive_copies_and_invalidates_on_write(tmp_path):
+    settings = Settings(
+        chroma_path=tmp_path / "chroma",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        retrieval_cache_size=4,
+    )
+    manager = VectorStoreManager(settings, embedding=FakeEmbeddings())
+    metadata = {
+        "chunk_id": "same-id",
+        "source": "unit",
+        "source_type": "text",
+        "page": -1,
+        "chunk_index": 0,
+        "content_hash": "abc",
+        "embedding_model": settings.embedding_model,
+        "citation_label": "unit",
+    }
+    manager.add_documents([Document(page_content="old rag content", metadata=metadata)], collection="default")
+
+    first = manager.search("rag", collection="default", top_k=1, fetch_k=1)
+    first[0].content = "mutated in caller"
+    second = manager.search("rag", collection="default", top_k=1, fetch_k=1)
+
+    assert second[0].content == "old rag content"
+
+    manager.add_documents([Document(page_content="new rag content", metadata=metadata)], collection="default")
+    after_write = manager.search("rag", collection="default", top_k=1, fetch_k=1)
+
+    assert after_write[0].content == "new rag content"
+
+
+def test_collection_stats_cache_returns_defensive_copies_and_invalidates_on_write(tmp_path):
+    settings = Settings(
+        chroma_path=tmp_path / "chroma",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        stats_cache_size=4,
+    )
+    manager = VectorStoreManager(settings, embedding=FakeEmbeddings())
+    base_metadata = {
+        "source_type": "text",
+        "page": -1,
+        "chunk_index": 0,
+        "embedding_model": settings.embedding_model,
+    }
+    manager.add_documents(
+        [
+            Document(
+                page_content="first cached stats document",
+                metadata={
+                    **base_metadata,
+                    "chunk_id": "first",
+                    "source": "first.md",
+                    "content_hash": "first",
+                    "citation_label": "first.md",
+                },
+            )
+        ],
+        collection="default",
+    )
+
+    first = manager.collection_stats("default")
+    first.sources.append("caller-mutation.md")
+    second = manager.collection_stats("default")
+
+    assert "caller-mutation.md" not in second.sources
+    assert second.chunk_count == 1
+
+    manager.add_documents(
+        [
+            Document(
+                page_content="second cached stats document",
+                metadata={
+                    **base_metadata,
+                    "chunk_id": "second",
+                    "source": "second.md",
+                    "content_hash": "second",
+                    "citation_label": "second.md",
+                },
+            )
+        ],
+        collection="default",
+    )
+
+    after_write = manager.collection_stats("default")
+
+    assert after_write.chunk_count == 2
+    assert after_write.source_count == 2
 
 
 def test_reingesting_same_chunk_id_replaces_existing_document(tmp_path):

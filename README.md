@@ -71,12 +71,18 @@ flowchart TD
     Q[Question] --> R{Question type}
     R -->|Specific| VS[Vector similarity search]
     R -->|Broad overview| OV[Representative collection overview]
-    VS --> CTX[Retrieved evidence chunks]
+    VS --> HY[Hybrid ranker + gated lexical fallback]
+    HY --> CACHE[Retrieval cache]
+    CACHE --> CTX[Retrieved evidence chunks]
     OV --> CTX
-    CTX --> A[Generate cited answer]
+    CTX --> GATE{Evidence strong enough?}
+    GATE -->|No| RW[Reformulate query]
+    GATE -->|Yes| A[Generate cited answer]
     A --> C{Critic grounded?}
-    C -->|Yes| OK[Return answer + citations]
-    C -->|No, attempts remain| RW[Reformulate query]
+    C -->|Yes| LC[Local grounding validator]
+    LC -->|Pass| OK[Return answer + citations + latency]
+    LC -->|Fail| RW
+    C -->|No, attempts remain| RW
     RW --> R
     C -->|No, exhausted| NA[Return insufficient-information fallback]
 ```
@@ -158,6 +164,8 @@ Then open `http://127.0.0.1:8501`.
 
 The UI is chat-first. The sidebar handles PDF/TXT/Markdown/HTML upload ingestion, server-local path ingestion, exact single-page URL ingestion, source selection, collection reset, and runtime checks.
 
+Each new UI chat starts with its own isolated Chroma collection. That means restarting the UI or pressing `New chat` will not automatically reuse documents from an older chat. Older chat workspaces remain available from `Chat logs`, and selecting a log restores that chat's messages and document workspace.
+
 `Sources to search` is the retrieval scope. Use one selected source when you ask vague questions like `What is this document about?`; keep several selected when you want the answer synthesized across multiple indexed documents.
 
 ## API
@@ -195,8 +203,12 @@ Defaults:
 - Chat model: `llama3:latest`
 - Embedding model: `nomic-embed-text`
 - Retrieval: `top_k=6`, `fetch_k=20`
+- Retrieval quality: vector search plus lexical fallback, source diversification, MMR-style reranking, and `min_retrieval_confidence=0.08`
+- Response time: in-memory retrieval cache size `128`, stats cache size `32`, same-thread answer cache size `64`, Ollama keep-alive `10m`, answer token cap `512`, local critic mode by default, deterministic query rewrite by default, and lexical fallback only when vector evidence does not already cover the query
 - Chunking: `chunk_size=1000`, `chunk_overlap=150`
 - Retry limit: `max_attempts=3`
+
+Every `/ask` response includes per-attempt timings (`retrieval_ms`, `generation_ms`, `critique_ms`, `total_ms`) plus full request `total_ms`.
 
 URL ingestion fetches only the exact URLs supplied. It blocks `file://`, localhost, and private-network targets unless `RAG_ALLOW_PRIVATE_URLS=true`.
 

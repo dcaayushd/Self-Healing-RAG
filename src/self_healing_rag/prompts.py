@@ -104,7 +104,11 @@ def parse_critic_json(raw: str, *, answer: str, chunks: list[RetrievedChunk]) ->
         raise ValueError("Critic did not return a JSON object.")
     data = json.loads(raw[start : end + 1])
     result = CriticResult.model_validate(data)
+    return validate_critic_result(result, answer=answer, chunks=chunks)
 
+
+def validate_critic_result(result: CriticResult, *, answer: str, chunks: list[RetrievedChunk]) -> CriticResult:
+    result = result.model_copy(deep=True)
     valid_ids = {chunk.citation_id for chunk in chunks}
     used_ids = cited_ids(answer)
     invalid = sorted(used_ids - valid_ids)
@@ -197,15 +201,36 @@ def _sentence_supported_by_chunks(sentence: str, chunks: list[RetrievedChunk]) -
     claim_tokens = _tokens(re.sub(_CITATION_RE, "", sentence))
     if len(claim_tokens) <= 2:
         return True
+    if not _surface_facts_supported(sentence, chunks):
+        return False
     evidence_tokens: set[str] = set()
     source_tokens: set[str] = set()
     for chunk in chunks:
         evidence_tokens |= _tokens(chunk.content)
         source_tokens |= _tokens(chunk.source) | _tokens(chunk.citation_label)
     overlap = claim_tokens & (evidence_tokens | source_tokens)
-    if len(overlap) >= min(3, len(claim_tokens)):
+    required = min(len(claim_tokens), max(2, round(len(claim_tokens) * 0.42)))
+    if len(overlap) >= required:
         return True
-    return (len(overlap) / len(claim_tokens)) >= 0.34
+    return (len(overlap) / len(claim_tokens)) >= 0.42
+
+
+def _surface_facts_supported(sentence: str, chunks: list[RetrievedChunk]) -> bool:
+    evidence = _normalize_source_text(
+        " ".join(f"{chunk.content} {chunk.source} {chunk.citation_label}" for chunk in chunks)
+    )
+    for fact in _required_surface_facts(sentence):
+        if _normalize_source_text(fact) not in evidence:
+            return False
+    return True
+
+
+def _required_surface_facts(sentence: str) -> set[str]:
+    cleaned = re.sub(_CITATION_RE, "", sentence)
+    numbers = set(re.findall(r"\b\d+(?:[.,]\d+)*(?:\.\d+)?%?\b", cleaned))
+    acronyms = {item for item in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", cleaned) if item not in {"PDF", "URL"}}
+    quoted = set(re.findall(r'"([^"]{3,80})"', cleaned))
+    return numbers | acronyms | quoted
 
 
 def _citation_ids_for_text(text: str, chunks: list[RetrievedChunk]) -> list[str]:

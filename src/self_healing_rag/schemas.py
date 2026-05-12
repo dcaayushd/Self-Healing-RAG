@@ -28,6 +28,10 @@ class AttemptTrace(BaseModel):
     invalid_citations: list[str] = Field(default_factory=list)
     retrieval_strategy: str = "vector"
     retrieval_confidence: float | None = None
+    retrieval_ms: float | None = None
+    generation_ms: float | None = None
+    critique_ms: float | None = None
+    total_ms: float | None = None
 
 
 class CriticResult(BaseModel):
@@ -75,6 +79,7 @@ class AskResponse(BaseModel):
     attempts: list[AttemptTrace] = Field(default_factory=list)
     thread_id: str
     focus_sources: list[str] = Field(default_factory=list)
+    total_ms: float | None = None
 
 
 class HealthResponse(BaseModel):

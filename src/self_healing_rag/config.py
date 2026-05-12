@@ -19,6 +19,18 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=1000, ge=100)
     chunk_overlap: int = Field(default=150, ge=0)
     max_attempts: int = Field(default=3, ge=1)
+    min_retrieval_confidence: float = Field(default=0.08, ge=0.0, le=1.0)
+    max_lexical_scan: int = Field(default=5000, ge=100)
+    retrieval_cache_size: int = Field(default=128, ge=0)
+    stats_cache_size: int = Field(default=32, ge=0)
+    answer_cache_size: int = Field(default=64, ge=0)
+    llm_num_ctx: int = Field(default=8192, ge=1024)
+    answer_num_predict: int = Field(default=512, ge=64)
+    critic_num_predict: int = Field(default=256, ge=64)
+    rewrite_num_predict: int = Field(default=96, ge=16)
+    critic_mode: str = Field(default="local", pattern="^(local|hybrid|llm)$")
+    use_llm_rewrite: bool = False
+    ollama_keep_alive: str = "10m"
     allow_private_urls: bool = False
     url_timeout_seconds: float = Field(default=20.0, gt=0)
 

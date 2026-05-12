@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from math import ceil
 from pathlib import Path
 import re
@@ -25,6 +25,8 @@ class VectorStoreManager:
             model=self.settings.embedding_model,
             base_url=self.settings.ollama_base_url,
         )
+        self._search_cache: OrderedDict[tuple, list[RetrievedChunk]] = OrderedDict()
+        self._stats_cache: OrderedDict[str, IndexStats] = OrderedDict()
 
     def add_documents(self, documents: list[Document], *, collection: str) -> list[str]:
         if not documents:
@@ -34,6 +36,7 @@ class VectorStoreManager:
         self._delete_existing_ids(collection, ids)
         vector_store = self._vector_store(collection)
         vector_store.add_documents(documents, ids=ids)
+        self._clear_collection_caches(collection)
         return ids
 
     def search(
@@ -46,11 +49,32 @@ class VectorStoreManager:
         focus_sources: list[str] | None = None,
     ) -> list[RetrievedChunk]:
         self._ensure_collection(collection)
+        cache_key = _search_cache_key(
+            query=query,
+            collection=collection,
+            top_k=top_k,
+            fetch_k=fetch_k,
+            focus_sources=focus_sources,
+        )
+        cached = self._cached_search(cache_key)
+        if cached is not None:
+            return cached
+
         vector_store = self._vector_store(collection)
         limit = max(top_k, fetch_k)
         where = source_filter_where(focus_sources)
         kwargs = {"filter": where} if where else {}
-        results = vector_store.similarity_search_with_score(query, k=limit, **kwargs)
+        vector_results = vector_store.similarity_search_with_score(query, k=limit, **kwargs)
+        lexical_results: list[tuple[Document, float]] = []
+        if _needs_lexical_fallback(query, vector_results, top_k=top_k):
+            lexical_results = self._lexical_candidates(
+                query,
+                collection=collection,
+                focus_sources=focus_sources,
+                exclude_ids={str(doc.metadata.get("chunk_id", "")) for doc, _ in vector_results},
+                limit=max(top_k, fetch_k // 2),
+            )
+        results = vector_results + lexical_results
         chunks: list[RetrievedChunk] = []
         for idx, ranked in enumerate(_select_ranked_results(query, results, top_k=top_k), start=1):
             chunks.append(
@@ -63,6 +87,7 @@ class VectorStoreManager:
                     fallback_index=idx - 1,
                 )
             )
+        self._store_search_cache(cache_key, chunks)
         return chunks
 
     def overview(self, *, collection: str, limit: int, focus_sources: list[str] | None = None) -> list[RetrievedChunk]:
@@ -99,26 +124,39 @@ class VectorStoreManager:
         ]
 
     def collection_stats(self, collection: str) -> IndexStats:
+        cached = self._cached_stats(collection)
+        if cached is not None:
+            return cached
+
         try:
             chroma_collection = self.client.get_collection(collection)
         except Exception:
-            return IndexStats(collection=collection, chunk_count=0, source_count=0, embedding_model=self.settings.embedding_model)
+            stats = IndexStats(
+                collection=collection,
+                chunk_count=0,
+                source_count=0,
+                embedding_model=self.settings.embedding_model,
+            )
+            self._store_stats_cache(collection, stats)
+            return stats
 
         count = chroma_collection.count()
         metadata = chroma_collection.metadata or {}
         if count == 0:
-            return IndexStats(
+            stats = IndexStats(
                 collection=collection,
                 chunk_count=0,
                 source_count=0,
                 embedding_model=str(metadata.get("embedding_model", self.settings.embedding_model)),
             )
+            self._store_stats_cache(collection, stats)
+            return stats
 
         result = chroma_collection.get(include=["metadatas"], limit=min(count, 5000))
         metadatas = [dict(item or {}) for item in result.get("metadatas", [])]
         sources = sorted({str(item.get("source", "unknown")) for item in metadatas})
         source_types = sorted({str(item.get("source_type", "unknown")) for item in metadatas})
-        return IndexStats(
+        stats = IndexStats(
             collection=collection,
             chunk_count=count,
             source_count=len(sources),
@@ -127,6 +165,8 @@ class VectorStoreManager:
             embedding_model=str(metadata.get("embedding_model", self.settings.embedding_model)),
             is_empty=False,
         )
+        self._store_stats_cache(collection, stats)
+        return stats
 
     def delete_sources(self, collection: str, sources: list[str]) -> int:
         if not sources:
@@ -139,6 +179,7 @@ class VectorStoreManager:
         ids = result.get("ids", [])
         if ids:
             chroma_collection.delete(ids=ids)
+            self._clear_collection_caches(collection)
         return len(ids)
 
     def delete_collection(self, collection: str) -> None:
@@ -147,6 +188,7 @@ class VectorStoreManager:
         except Exception as exc:
             if "does not exist" not in str(exc).lower():
                 raise
+        self._clear_collection_caches(collection)
 
     def _vector_store(self, collection: str) -> Chroma:
         return Chroma(
@@ -176,9 +218,122 @@ class VectorStoreManager:
         if existing:
             chroma_collection.delete(ids=existing)
 
+    def _lexical_candidates(
+        self,
+        query: str,
+        *,
+        collection: str,
+        focus_sources: list[str] | None,
+        exclude_ids: set[str],
+        limit: int,
+    ) -> list[tuple[Document, float]]:
+        if not _tokens(query):
+            return []
+        chroma_collection = self.client.get_collection(collection)
+        count = chroma_collection.count()
+        if count == 0:
+            return []
+
+        where = source_filter_where(focus_sources)
+        kwargs = {"where": where} if where else {}
+        result = chroma_collection.get(
+            include=["documents", "metadatas"],
+            limit=min(count, self.settings.max_lexical_scan),
+            **kwargs,
+        )
+        candidates: list[tuple[Document, float, float]] = []
+        for doc_id, content, metadata in zip(
+            result.get("ids", []),
+            result.get("documents", []),
+            result.get("metadatas", []),
+            strict=False,
+        ):
+            if doc_id in exclude_ids or not content:
+                continue
+            metadata = dict(metadata or {})
+            metadata.setdefault("chunk_id", doc_id)
+            lexical_score = _lexical_overlap(
+                query,
+                f"{metadata.get('source', '')} {metadata.get('citation_label', '')} {content}",
+            )
+            if lexical_score <= 0:
+                continue
+            # Chroma returns lower-is-better distances. Lexical candidates use a synthetic distance
+            # so exact keyword matches can enter the ranker without pretending to be vector-near.
+            synthetic_distance = max(0.0, 1.0 - lexical_score) + 0.05
+            candidates.append((Document(page_content=content, metadata=metadata), synthetic_distance, lexical_score))
+
+        candidates.sort(key=lambda item: item[2], reverse=True)
+        return [(doc, distance) for doc, distance, _ in candidates[:limit]]
+
+    def _cached_search(self, cache_key: tuple) -> list[RetrievedChunk] | None:
+        if not self.settings.retrieval_cache_size:
+            return None
+        cached = self._search_cache.get(cache_key)
+        if cached is None:
+            return None
+        self._search_cache.move_to_end(cache_key)
+        return [chunk.model_copy(deep=True) for chunk in cached]
+
+    def _store_search_cache(self, cache_key: tuple, chunks: list[RetrievedChunk]) -> None:
+        if not self.settings.retrieval_cache_size:
+            return
+        self._search_cache[cache_key] = [chunk.model_copy(deep=True) for chunk in chunks]
+        self._search_cache.move_to_end(cache_key)
+        while len(self._search_cache) > self.settings.retrieval_cache_size:
+            self._search_cache.popitem(last=False)
+
+    def _clear_search_cache(self, collection: str | None = None) -> None:
+        if collection is None:
+            self._search_cache.clear()
+            return
+        for key in list(self._search_cache):
+            if len(key) > 1 and key[1] == collection:
+                self._search_cache.pop(key, None)
+
+    def _cached_stats(self, collection: str) -> IndexStats | None:
+        if not self.settings.stats_cache_size:
+            return None
+        cached = self._stats_cache.get(collection)
+        if cached is None:
+            return None
+        self._stats_cache.move_to_end(collection)
+        return cached.model_copy(deep=True)
+
+    def _store_stats_cache(self, collection: str, stats: IndexStats) -> None:
+        if not self.settings.stats_cache_size:
+            return
+        self._stats_cache[collection] = stats.model_copy(deep=True)
+        self._stats_cache.move_to_end(collection)
+        while len(self._stats_cache) > self.settings.stats_cache_size:
+            self._stats_cache.popitem(last=False)
+
+    def _clear_stats_cache(self, collection: str | None = None) -> None:
+        if collection is None:
+            self._stats_cache.clear()
+            return
+        self._stats_cache.pop(collection, None)
+
+    def _clear_collection_caches(self, collection: str | None = None) -> None:
+        self._clear_search_cache(collection)
+        self._clear_stats_cache(collection)
+
 
 def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _search_cache_key(
+    *,
+    query: str,
+    collection: str,
+    top_k: int,
+    fetch_k: int,
+    focus_sources: list[str] | None,
+) -> tuple:
+    normalized_query = re.sub(r"\s+", " ", query.strip().lower())
+    normalized_sources = tuple(sorted(source for source in focus_sources or [] if source))
+    return (normalized_query, collection, top_k, fetch_k, normalized_sources)
 
 
 def _chunk_from_document(
@@ -296,6 +451,38 @@ def _select_ranked_results(query: str, results: list[tuple[Document, float]], *,
     scored.sort(key=lambda item: item[2], reverse=True)
     selected = _mmr_select(scored, top_k=top_k)
     return [RankedResult(doc, distance, relevance) for doc, distance, relevance in selected]
+
+
+def _needs_lexical_fallback(query: str, vector_results: list[tuple[Document, float]], *, top_k: int) -> bool:
+    query_tokens = _tokens(query)
+    if not query_tokens:
+        return False
+    if not vector_results:
+        return True
+    if len(vector_results) < top_k:
+        return True
+
+    top_results = vector_results[: max(1, min(top_k, 3))]
+    coverage_scores = [_candidate_coverage(query_tokens, doc) for doc, _ in top_results]
+    best_coverage = max(coverage_scores, default=0.0)
+    mean_coverage = sum(coverage_scores) / len(coverage_scores)
+
+    if best_coverage >= 0.80:
+        return False
+    if best_coverage >= 0.60 and mean_coverage >= 0.35:
+        return False
+    return True
+
+
+def _candidate_coverage(query_tokens: set[str], doc: Document) -> float:
+    if not query_tokens:
+        return 0.0
+    candidate_tokens = _tokens(
+        f"{doc.metadata.get('source', '')} {doc.metadata.get('citation_label', '')} {doc.page_content}"
+    )
+    if not candidate_tokens:
+        return 0.0
+    return len(query_tokens & candidate_tokens) / len(query_tokens)
 
 
 def _dedupe_results(results: list[tuple[Document, float]]) -> list[tuple[Document, float]]:
